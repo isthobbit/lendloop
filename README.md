@@ -48,35 +48,35 @@ I built it as if it would one day hold sensitive records rather than ladders and
 ```mermaid
 flowchart LR
   subgraph Browser
-    UI[Next.js App Router<br/>React client]
+    UI["Next.js App Router<br/>React client"]
   end
-  Clerk[(Clerk<br/>identity)]
+  Clerk[("Clerk<br/>identity")]
   subgraph Convex
-    Q[queries / mutations<br/>RBAC in every function]
-    OB[(outbox)]
-    H[HTTP actions<br/>/n8n/*  HMAC-verified]
-    DB[(tables:<br/>users, tools, loans,<br/>automationEvents, auditLog …)]
+    Q["queries / mutations<br/>RBAC in every function"]
+    OB[("outbox")]
+    H["HTTP actions<br/>/n8n/* HMAC-verified"]
+    DB[("tables:<br/>users, tools, loans,<br/>automationEvents, auditLog …")]
   end
-  subgraph n8n
-    W1[Loan event<br/>notifications]
-    W2[Daily overdue<br/>reminders]
-    W3[Error handler]
+  subgraph n8nBox["n8n"]
+    W1["Loan event<br/>notifications"]
+    W2["Daily overdue<br/>reminders"]
+    W3["Error handler"]
   end
-  Notify[[Email / Slack / mock]]
+  Notify[["Email / Slack / mock"]]
 
-  UI -- Clerk session --> Clerk
-  UI -- JWT (verified by Convex) --> Q
+  UI -->|"Clerk session"| Clerk
+  UI -->|"JWT (verified by Convex)"| Q
   Q --> DB
-  Q -- same transaction --> OB
-  OB -- signed webhook<br/>ids + ticket only --> W1
-  W1 -- signed: redeem ticket --> H
+  Q -->|"same transaction"| OB
+  OB -->|"signed webhook<br/>ids + ticket only"| W1
+  W1 -->|"signed: redeem ticket"| H
   W1 --> Notify
-  W1 -- signed: idempotent write-back --> H
-  W2 -- signed: issue + redeem tickets --> H
+  W1 -->|"signed: idempotent write-back"| H
+  W2 -->|"signed: issue + redeem tickets"| H
   W2 --> Notify
-  W2 -- signed: batch write-back --> H
-  W1 & W2 -. on failure .-> W3
-  W3 -- signed: error report --> H
+  W2 -->|"signed: batch write-back"| H
+  W1 & W2 -.->|"on failure"| W3
+  W3 -->|"signed: error report"| H
   H --> DB
 ```
 
@@ -97,7 +97,7 @@ sequenceDiagram
   C->>N: {recipient.email, firstName, toolName, dates}
   N->>L: notification (email masked in logs)
   N->>C: POST /n8n/automation-events {notification_sent, ticket}  (signed)
-  C->>C: consume ticket, record once (key = notify:<eventId>)
+  C->>C: consume ticket, record once (key = notify:eventId)
   B->>C: (live query) "Notification sent 1 minute ago"
 ```
 
