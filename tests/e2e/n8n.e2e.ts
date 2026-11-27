@@ -153,7 +153,12 @@ const cliAsync = (...args: string[]) =>
     let out = "";
     p.stdout.on("data", (d) => (out += d));
     p.stderr.on("data", (d) => (out += d));
-    p.on("close", (code) => (code === 0 ? resolve(out) : reject(new Error(`n8n ${args.join(" ")} failed:\n${out.slice(-3000)}`))));
+    p.on("close", (code) => {
+      // `n8n execute` runs workflows in this process, so its console output belongs in the log checks too.
+      logs += out;
+      if (code === 0) resolve(out);
+      else reject(new Error(`n8n ${args.join(" ")} failed:\n${out.slice(-3000)}`));
+    });
   });
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
