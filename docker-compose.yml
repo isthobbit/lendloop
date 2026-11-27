@@ -1,0 +1,68 @@
+name: lendloop
+
+# Local n8n for LendLoop.
+#   cp .env.n8n.example .env.n8n          # fill in (node scripts/gen-secrets.mjs)
+#   docker compose --profile setup run --rm n8n-import   # import the 3 workflows
+#   docker compose up -d n8n                              # http://localhost:5678
+# Optional public URL for a cloud Convex deployment to reach your webhook:
+#   docker compose --profile tunnel up tunnel             # prints a trycloudflare URL
+
+x-n8n: &n8n
+  # Pin an exact version (and ideally a digest) in production.
+  image: docker.n8n.io/n8nio/n8n:${N8N_VERSION:-latest}
+  env_file: .env.n8n
+  environment:
+    GENERIC_TIMEZONE: UTC
+    TZ: UTC
+    N8N_HOST: localhost
+    N8N_PORT: "5678"
+    N8N_PROTOCOL: http
+    WEBHOOK_URL: ${N8N_PUBLIC_URL:-http://localhost:5678/}
+    # The Code nodes need node:crypto for HMAC, and read LENDLOOP_* secrets via $env.
+    NODE_FUNCTION_ALLOW_BUILTIN: crypto
+    N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+    # Code-node console output (mock deliveries, masked) goes to `docker compose logs n8n`.
+    CODE_ENABLE_STDOUT: "true"
+    # Data minimization: don't keep successful runs (they briefly hold an email);
+    # keep failures for 7 days for debugging.
+    EXECUTIONS_DATA_SAVE_ON_SUCCESS: none
+    EXECUTIONS_DATA_SAVE_ON_ERROR: all
+    EXECUTIONS_DATA_PRUNE: "true"
+    EXECUTIONS_DATA_MAX_AGE: "168"
+    N8N_DIAGNOSTICS_ENABLED: "false"
+    N8N_PERSONALIZATION_ENABLED: "false"
+    N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
+    # Local http only. Remove in production (behind TLS).
+    N8N_SECURE_COOKIE: "false"
+  volumes:
+    - n8n_data:/home/node/.n8n
+    - ./n8n/workflows:/workflows:ro
+  extra_hosts:
+    # Lets n8n reach a local Convex backend (npx convex dev --local) on the host.
+    - "host.docker.internal:host-gateway"
+
+services:
+  n8n:
+    <<: *n8n
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5678:5678" # loopback only; never expose the editor publicly
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5678/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  n8n-import:
+    <<: *n8n
+    profiles: ["setup"]
+    command: ["import:workflow", "--separate", "--input=/workflows"]
+
+  tunnel:
+    profiles: ["tunnel"]
+    image: cloudflare/cloudflared:latest
+    command: ["tunnel", "--no-autoupdate", "--url", "http://n8n:5678"]
+    depends_on: [n8n]
+
+volumes:
+  n8n_data:

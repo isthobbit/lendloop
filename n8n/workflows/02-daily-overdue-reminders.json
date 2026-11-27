@@ -1,0 +1,509 @@
+{
+  "id": "LLoverdueRemind1",
+  "name": "LendLoop: Daily overdue reminders",
+  "active": false,
+  "nodes": [
+    {
+      "id": "d6704e8b-6ab2-5be4-a40d-d5673615a91f",
+      "position": [
+        240,
+        300
+      ],
+      "name": "Every day 08:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 8
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "b33caea9-7b1d-5499-ab28-0772a5c47d39",
+      "position": [
+        240,
+        120
+      ],
+      "name": "Run now (manual)",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "parameters": {}
+    },
+    {
+      "id": "439fec7b-a5ef-5853-a59d-68a87e7ed0ae",
+      "position": [
+        480,
+        300
+      ],
+      "name": "Start",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "return [{ json: { ctx: {} } }];\n"
+      }
+    },
+    {
+      "id": "a848a26e-6e83-53c9-a159-1a8983b1b85c",
+      "position": [
+        720,
+        300
+      ],
+      "name": "Sign: issue reminder tickets",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "// LendLoop signing helpers for n8n Code nodes.\n// Source of truth for the snippet that scripts/build-n8n-workflows.mjs inlines\n// into every Code node that signs or verifies. Mirrors convex/lib/signing.ts;\n// tests/signing.test.ts proves the two are interoperable.\n//\n// Requires NODE_FUNCTION_ALLOW_BUILTIN=crypto on the n8n instance.\nconst crypto = require('crypto');\nconst LL_VERSION = 'LENDLOOP-HMAC-SHA256-V1';\nconst LL_MAX_SKEW = 300;\n\nfunction llParseKeys(raw) {\n  const ring = new Map();\n  for (const part of String(raw || '').split(',')) {\n    const i = part.indexOf(':');\n    if (i <= 0) continue;\n    const kid = part.slice(0, i).trim();\n    const secret = part.slice(i + 1).trim();\n    if (kid && secret.length >= 32) ring.set(kid, secret);\n  }\n  return ring;\n}\n\nfunction llCanonical(p) {\n  const bodyHash = crypto.createHash('sha256').update(p.body, 'utf8').digest('hex');\n  return [LL_VERSION, p.keyId, p.timestamp, p.nonce, p.method.toUpperCase(), p.route, bodyHash].join('\\n');\n}\n\nfunction llSign(p) {\n  const first = llParseKeys(p.keys).entries().next();\n  if (first.done) throw new Error('LendLoop signing key is not configured');\n  const [keyId, secret] = first.value;\n  const timestamp = String(Math.floor((p.now || Date.now()) / 1000));\n  const nonce = crypto.randomBytes(16).toString('hex');\n  const sig = crypto\n    .createHmac('sha256', secret)\n    .update(llCanonical({ keyId, timestamp, nonce, method: p.method, route: p.route, body: p.body }), 'utf8')\n    .digest('hex');\n  return {\n    'x-lendloop-key-id': keyId,\n    'x-lendloop-timestamp': timestamp,\n    'x-lendloop-nonce': nonce,\n    'x-lendloop-signature': sig,\n  };\n}\n\nfunction llVerify(p) {\n  const h = {};\n  for (const [k, v] of Object.entries(p.headers || {})) h[k.toLowerCase()] = Array.isArray(v) ? v[0] : v;\n  const keyId = h['x-lendloop-key-id'] || '';\n  const ts = h['x-lendloop-timestamp'] || '';\n  const nonce = h['x-lendloop-nonce'] || '';\n  const sig = h['x-lendloop-signature'] || '';\n  if (!keyId || !ts || !nonce || !sig) return { ok: false, reason: 'missing_headers' };\n  if (!/^[0-9a-f]{32}$/i.test(nonce)) return { ok: false, reason: 'bad_nonce' };\n  if (!/^\\d{9,11}$/.test(ts)) return { ok: false, reason: 'bad_timestamp' };\n  const secret = llParseKeys(p.keys).get(keyId);\n  if (!secret) return { ok: false, reason: 'unknown_key' };\n  const nowSec = Math.floor((p.now || Date.now()) / 1000);\n  if (Math.abs(nowSec - Number(ts)) > LL_MAX_SKEW) return { ok: false, reason: 'stale' };\n  if (!/^[0-9a-f]{64}$/i.test(sig)) return { ok: false, reason: 'bad_signature_format' };\n  const expected = crypto\n    .createHmac('sha256', secret)\n    .update(llCanonical({ keyId, timestamp: ts, nonce, method: p.method, route: p.route, body: p.body }), 'utf8')\n    .digest();\n  const given = Buffer.from(sig, 'hex');\n  if (!crypto.timingSafeEqual(expected, given)) return { ok: false, reason: 'bad_signature' };\n  return { ok: true, keyId, nonce, timestamp: Number(ts) };\n}\n\nfunction llMaskEmail(email) {\n  const [local, domain] = String(email || '').split('@');\n  return local ? local.slice(0, 1) + '***@' + (domain || '') : '-';\n}\n\nconst input = $input.first().json;\nconst ctx = input.ctx;\nconst attempt = input.attempt || 0;\nconst base = String($env.LENDLOOP_CONVEX_SITE_URL || '').replace(/\\/$/, '');\nif (!base) throw new Error('LENDLOOP_CONVEX_SITE_URL is not set');\nconst body = '{}';\nconst headers = llSign({ keys: $env.LENDLOOP_N2C_KEYS, method: 'POST', route: '/n8n/reminders/tickets', body });\nreturn [{ json: { ctx, attempt, request: { url: base + '/n8n/reminders/tickets', body, headers } } }];\n"
+      }
+    },
+    {
+      "id": "0726464b-a539-5207-abd7-4c2d676dd03c",
+      "position": [
+        960,
+        300
+      ],
+      "name": "HTTP: issue reminder tickets",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.request.url }}",
+        "sendHeaders": true,
+        "specifyHeaders": "json",
+        "jsonHeaders": "={{ JSON.stringify($json.request.headers) }}",
+        "options": {
+          "timeout": 10000
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.request.body }}"
+      }
+    },
+    {
+      "id": "cf31f70a-2d4a-5b49-a300-5d557ec79f9a",
+      "position": [
+        960,
+        520
+      ],
+      "name": "Retry gate: issue reminder tickets",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "const prev = $('Sign: issue reminder tickets').first().json;\n// Report only the error itself (never the signed request/headers).\nconst j = $input.first().json;\nconst e = j.error || {};\nconst detail = (typeof e === 'string' ? e : [e.httpCode || e.status || '', e.message || '', e.description || ''].join(' ').trim() || 'unknown error').slice(0, 300);\n\nif (/\\b(400|401|403|413|422)\\b/.test(detail)) {\n  throw new Error('issue reminder tickets rejected by Convex (not retryable): ' + detail);\n}\nconst attempt = (prev.attempt || 0) + 1;\nif (attempt >= 4) {\n  throw new Error('issue reminder tickets failed after ' + attempt + ' attempts: ' + detail);\n}\nreturn [{ json: { ctx: prev.ctx, attempt } }];\n"
+      }
+    },
+    {
+      "id": "d7345517-f575-5fd0-a905-7ba83532427d",
+      "position": [
+        1200,
+        520
+      ],
+      "name": "Backoff: issue reminder tickets",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "webhookId": "63ddb877-20f9-54b2-aefc-f0c07c84a14a",
+      "parameters": {
+        "amount": "={{ Math.min(30, Math.pow(2, $json.attempt)) }}",
+        "unit": "seconds"
+      }
+    },
+    {
+      "id": "d126ea51-0c30-5331-a209-6e30081c05d1",
+      "position": [
+        1200,
+        300
+      ],
+      "name": "Any reminders due?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "// Convex already left out loans reminded today (server-side idempotency).\nconst tickets = ($input.first().json.tickets || []).map((t) => t.ticket);\nif (tickets.length === 0) return [];\nreturn [{ json: { ctx: { tickets } } }];\n"
+      }
+    },
+    {
+      "id": "868df070-3399-5621-acfe-ec2674912e60",
+      "position": [
+        1440,
+        300
+      ],
+      "name": "Sign: redeem reminder tickets",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "// LendLoop signing helpers for n8n Code nodes.\n// Source of truth for the snippet that scripts/build-n8n-workflows.mjs inlines\n// into every Code node that signs or verifies. Mirrors convex/lib/signing.ts;\n// tests/signing.test.ts proves the two are interoperable.\n//\n// Requires NODE_FUNCTION_ALLOW_BUILTIN=crypto on the n8n instance.\nconst crypto = require('crypto');\nconst LL_VERSION = 'LENDLOOP-HMAC-SHA256-V1';\nconst LL_MAX_SKEW = 300;\n\nfunction llParseKeys(raw) {\n  const ring = new Map();\n  for (const part of String(raw || '').split(',')) {\n    const i = part.indexOf(':');\n    if (i <= 0) continue;\n    const kid = part.slice(0, i).trim();\n    const secret = part.slice(i + 1).trim();\n    if (kid && secret.length >= 32) ring.set(kid, secret);\n  }\n  return ring;\n}\n\nfunction llCanonical(p) {\n  const bodyHash = crypto.createHash('sha256').update(p.body, 'utf8').digest('hex');\n  return [LL_VERSION, p.keyId, p.timestamp, p.nonce, p.method.toUpperCase(), p.route, bodyHash].join('\\n');\n}\n\nfunction llSign(p) {\n  const first = llParseKeys(p.keys).entries().next();\n  if (first.done) throw new Error('LendLoop signing key is not configured');\n  const [keyId, secret] = first.value;\n  const timestamp = String(Math.floor((p.now || Date.now()) / 1000));\n  const nonce = crypto.randomBytes(16).toString('hex');\n  const sig = crypto\n    .createHmac('sha256', secret)\n    .update(llCanonical({ keyId, timestamp, nonce, method: p.method, route: p.route, body: p.body }), 'utf8')\n    .digest('hex');\n  return {\n    'x-lendloop-key-id': keyId,\n    'x-lendloop-timestamp': timestamp,\n    'x-lendloop-nonce': nonce,\n    'x-lendloop-signature': sig,\n  };\n}\n\nfunction llVerify(p) {\n  const h = {};\n  for (const [k, v] of Object.entries(p.headers || {})) h[k.toLowerCase()] = Array.isArray(v) ? v[0] : v;\n  const keyId = h['x-lendloop-key-id'] || '';\n  const ts = h['x-lendloop-timestamp'] || '';\n  const nonce = h['x-lendloop-nonce'] || '';\n  const sig = h['x-lendloop-signature'] || '';\n  if (!keyId || !ts || !nonce || !sig) return { ok: false, reason: 'missing_headers' };\n  if (!/^[0-9a-f]{32}$/i.test(nonce)) return { ok: false, reason: 'bad_nonce' };\n  if (!/^\\d{9,11}$/.test(ts)) return { ok: false, reason: 'bad_timestamp' };\n  const secret = llParseKeys(p.keys).get(keyId);\n  if (!secret) return { ok: false, reason: 'unknown_key' };\n  const nowSec = Math.floor((p.now || Date.now()) / 1000);\n  if (Math.abs(nowSec - Number(ts)) > LL_MAX_SKEW) return { ok: false, reason: 'stale' };\n  if (!/^[0-9a-f]{64}$/i.test(sig)) return { ok: false, reason: 'bad_signature_format' };\n  const expected = crypto\n    .createHmac('sha256', secret)\n    .update(llCanonical({ keyId, timestamp: ts, nonce, method: p.method, route: p.route, body: p.body }), 'utf8')\n    .digest();\n  const given = Buffer.from(sig, 'hex');\n  if (!crypto.timingSafeEqual(expected, given)) return { ok: false, reason: 'bad_signature' };\n  return { ok: true, keyId, nonce, timestamp: Number(ts) };\n}\n\nfunction llMaskEmail(email) {\n  const [local, domain] = String(email || '').split('@');\n  return local ? local.slice(0, 1) + '***@' + (domain || '') : '-';\n}\n\nconst input = $input.first().json;\nconst ctx = input.ctx;\nconst attempt = input.attempt || 0;\nconst base = String($env.LENDLOOP_CONVEX_SITE_URL || '').replace(/\\/$/, '');\nif (!base) throw new Error('LENDLOOP_CONVEX_SITE_URL is not set');\nconst body = JSON.stringify({ tickets: ctx.tickets });\nconst headers = llSign({ keys: $env.LENDLOOP_N2C_KEYS, method: 'POST', route: '/n8n/reminders/redeem', body });\nreturn [{ json: { ctx, attempt, request: { url: base + '/n8n/reminders/redeem', body, headers } } }];\n"
+      }
+    },
+    {
+      "id": "c5a2d3ac-e7ff-5625-a2cf-7e962e9b0851",
+      "position": [
+        1680,
+        300
+      ],
+      "name": "HTTP: redeem reminder tickets",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.request.url }}",
+        "sendHeaders": true,
+        "specifyHeaders": "json",
+        "jsonHeaders": "={{ JSON.stringify($json.request.headers) }}",
+        "options": {
+          "timeout": 10000
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.request.body }}"
+      }
+    },
+    {
+      "id": "c10fdac1-fd6b-5aaf-a812-2989ed4144d5",
+      "position": [
+        1680,
+        520
+      ],
+      "name": "Retry gate: redeem reminder tickets",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "const prev = $('Sign: redeem reminder tickets').first().json;\n// Report only the error itself (never the signed request/headers).\nconst j = $input.first().json;\nconst e = j.error || {};\nconst detail = (typeof e === 'string' ? e : [e.httpCode || e.status || '', e.message || '', e.description || ''].join(' ').trim() || 'unknown error').slice(0, 300);\n\nif (/\\b(400|401|403|413|422)\\b/.test(detail)) {\n  throw new Error('redeem reminder tickets rejected by Convex (not retryable): ' + detail);\n}\nconst attempt = (prev.attempt || 0) + 1;\nif (attempt >= 4) {\n  throw new Error('redeem reminder tickets failed after ' + attempt + ' attempts: ' + detail);\n}\nreturn [{ json: { ctx: prev.ctx, attempt } }];\n"
+      }
+    },
+    {
+      "id": "909aa194-d9d6-553c-a88f-536ef6f9805e",
+      "position": [
+        1920,
+        520
+      ],
+      "name": "Backoff: redeem reminder tickets",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "webhookId": "fbb204d9-064f-5d14-a4a1-2ba442b9422b",
+      "parameters": {
+        "amount": "={{ Math.min(30, Math.pow(2, $json.attempt)) }}",
+        "unit": "seconds"
+      }
+    },
+    {
+      "id": "25540816-0804-539d-ae14-c8cc36876e55",
+      "position": [
+        1920,
+        300
+      ],
+      "name": "Send reminders (mock)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "// LendLoop signing helpers for n8n Code nodes.\n// Source of truth for the snippet that scripts/build-n8n-workflows.mjs inlines\n// into every Code node that signs or verifies. Mirrors convex/lib/signing.ts;\n// tests/signing.test.ts proves the two are interoperable.\n//\n// Requires NODE_FUNCTION_ALLOW_BUILTIN=crypto on the n8n instance.\nconst crypto = require('crypto');\nconst LL_VERSION = 'LENDLOOP-HMAC-SHA256-V1';\nconst LL_MAX_SKEW = 300;\n\nfunction llParseKeys(raw) {\n  const ring = new Map();\n  for (const part of String(raw || '').split(',')) {\n    const i = part.indexOf(':');\n    if (i <= 0) continue;\n    const kid = part.slice(0, i).trim();\n    const secret = part.slice(i + 1).trim();\n    if (kid && secret.length >= 32) ring.set(kid, secret);\n  }\n  return ring;\n}\n\nfunction llCanonical(p) {\n  const bodyHash = crypto.createHash('sha256').update(p.body, 'utf8').digest('hex');\n  return [LL_VERSION, p.keyId, p.timestamp, p.nonce, p.method.toUpperCase(), p.route, bodyHash].join('\\n');\n}\n\nfunction llSign(p) {\n  const first = llParseKeys(p.keys).entries().next();\n  if (first.done) throw new Error('LendLoop signing key is not configured');\n  const [keyId, secret] = first.value;\n  const timestamp = String(Math.floor((p.now || Date.now()) / 1000));\n  const nonce = crypto.randomBytes(16).toString('hex');\n  const sig = crypto\n    .createHmac('sha256', secret)\n    .update(llCanonical({ keyId, timestamp, nonce, method: p.method, route: p.route, body: p.body }), 'utf8')\n    .digest('hex');\n  return {\n    'x-lendloop-key-id': keyId,\n    'x-lendloop-timestamp': timestamp,\n    'x-lendloop-nonce': nonce,\n    'x-lendloop-signature': sig,\n  };\n}\n\nfunction llVerify(p) {\n  const h = {};\n  for (const [k, v] of Object.entries(p.headers || {})) h[k.toLowerCase()] = Array.isArray(v) ? v[0] : v;\n  const keyId = h['x-lendloop-key-id'] || '';\n  const ts = h['x-lendloop-timestamp'] || '';\n  const nonce = h['x-lendloop-nonce'] || '';\n  const sig = h['x-lendloop-signature'] || '';\n  if (!keyId || !ts || !nonce || !sig) return { ok: false, reason: 'missing_headers' };\n  if (!/^[0-9a-f]{32}$/i.test(nonce)) return { ok: false, reason: 'bad_nonce' };\n  if (!/^\\d{9,11}$/.test(ts)) return { ok: false, reason: 'bad_timestamp' };\n  const secret = llParseKeys(p.keys).get(keyId);\n  if (!secret) return { ok: false, reason: 'unknown_key' };\n  const nowSec = Math.floor((p.now || Date.now()) / 1000);\n  if (Math.abs(nowSec - Number(ts)) > LL_MAX_SKEW) return { ok: false, reason: 'stale' };\n  if (!/^[0-9a-f]{64}$/i.test(sig)) return { ok: false, reason: 'bad_signature_format' };\n  const expected = crypto\n    .createHmac('sha256', secret)\n    .update(llCanonical({ keyId, timestamp: ts, nonce, method: p.method, route: p.route, body: p.body }), 'utf8')\n    .digest();\n  const given = Buffer.from(sig, 'hex');\n  if (!crypto.timingSafeEqual(expected, given)) return { ok: false, reason: 'bad_signature' };\n  return { ok: true, keyId, nonce, timestamp: Number(ts) };\n}\n\nfunction llMaskEmail(email) {\n  const [local, domain] = String(email || '').split('@');\n  return local ? local.slice(0, 1) + '***@' + (domain || '') : '-';\n}\n\n// With the redeem response, the only place that holds an email address.\nconst reminders = $input.first().json.reminders || [];\nif (reminders.length === 0) return [];\nconst events = [];\nfor (const r of reminders) {\n  const base = { loanId: r.loanId, ticket: r.ticket, channel: 'mock', executionId: String($execution.id) };\n  try {\n    const text = 'Hi ' + r.borrower.firstName + ', the ' + r.toolName + ' was due back on ' + r.dueDate\n      + ' (' + r.daysOverdue + ' day' + (r.daysOverdue === 1 ? '' : 's') + ' ago). Please arrange the return with the lender.';\n    // ---- Mock channel; swap for Send Email / Slack with an n8n credential.\n    console.log('[lendloop] reminder -> ' + llMaskEmail(r.borrower.email) + ' | ' + text);\n    events.push({ kind: 'reminder_sent', ...base });\n  } catch (e) {\n    events.push({ kind: 'reminder_failed', ...base });\n  }\n}\n// Emails stop here: the write-back carries ids, tickets and outcomes only.\nreturn [{ json: { ctx: { events } } }];\n"
+      }
+    },
+    {
+      "id": "bb4b820f-5fe0-501b-a500-637a6d42e987",
+      "position": [
+        2160,
+        300
+      ],
+      "name": "Sign: write back reminders",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "// LendLoop signing helpers for n8n Code nodes.\n// Source of truth for the snippet that scripts/build-n8n-workflows.mjs inlines\n// into every Code node that signs or verifies. Mirrors convex/lib/signing.ts;\n// tests/signing.test.ts proves the two are interoperable.\n//\n// Requires NODE_FUNCTION_ALLOW_BUILTIN=crypto on the n8n instance.\nconst crypto = require('crypto');\nconst LL_VERSION = 'LENDLOOP-HMAC-SHA256-V1';\nconst LL_MAX_SKEW = 300;\n\nfunction llParseKeys(raw) {\n  const ring = new Map();\n  for (const part of String(raw || '').split(',')) {\n    const i = part.indexOf(':');\n    if (i <= 0) continue;\n    const kid = part.slice(0, i).trim();\n    const secret = part.slice(i + 1).trim();\n    if (kid && secret.length >= 32) ring.set(kid, secret);\n  }\n  return ring;\n}\n\nfunction llCanonical(p) {\n  const bodyHash = crypto.createHash('sha256').update(p.body, 'utf8').digest('hex');\n  return [LL_VERSION, p.keyId, p.timestamp, p.nonce, p.method.toUpperCase(), p.route, bodyHash].join('\\n');\n}\n\nfunction llSign(p) {\n  const first = llParseKeys(p.keys).entries().next();\n  if (first.done) throw new Error('LendLoop signing key is not configured');\n  const [keyId, secret] = first.value;\n  const timestamp = String(Math.floor((p.now || Date.now()) / 1000));\n  const nonce = crypto.randomBytes(16).toString('hex');\n  const sig = crypto\n    .createHmac('sha256', secret)\n    .update(llCanonical({ keyId, timestamp, nonce, method: p.method, route: p.route, body: p.body }), 'utf8')\n    .digest('hex');\n  return {\n    'x-lendloop-key-id': keyId,\n    'x-lendloop-timestamp': timestamp,\n    'x-lendloop-nonce': nonce,\n    'x-lendloop-signature': sig,\n  };\n}\n\nfunction llVerify(p) {\n  const h = {};\n  for (const [k, v] of Object.entries(p.headers || {})) h[k.toLowerCase()] = Array.isArray(v) ? v[0] : v;\n  const keyId = h['x-lendloop-key-id'] || '';\n  const ts = h['x-lendloop-timestamp'] || '';\n  const nonce = h['x-lendloop-nonce'] || '';\n  const sig = h['x-lendloop-signature'] || '';\n  if (!keyId || !ts || !nonce || !sig) return { ok: false, reason: 'missing_headers' };\n  if (!/^[0-9a-f]{32}$/i.test(nonce)) return { ok: false, reason: 'bad_nonce' };\n  if (!/^\\d{9,11}$/.test(ts)) return { ok: false, reason: 'bad_timestamp' };\n  const secret = llParseKeys(p.keys).get(keyId);\n  if (!secret) return { ok: false, reason: 'unknown_key' };\n  const nowSec = Math.floor((p.now || Date.now()) / 1000);\n  if (Math.abs(nowSec - Number(ts)) > LL_MAX_SKEW) return { ok: false, reason: 'stale' };\n  if (!/^[0-9a-f]{64}$/i.test(sig)) return { ok: false, reason: 'bad_signature_format' };\n  const expected = crypto\n    .createHmac('sha256', secret)\n    .update(llCanonical({ keyId, timestamp: ts, nonce, method: p.method, route: p.route, body: p.body }), 'utf8')\n    .digest();\n  const given = Buffer.from(sig, 'hex');\n  if (!crypto.timingSafeEqual(expected, given)) return { ok: false, reason: 'bad_signature' };\n  return { ok: true, keyId, nonce, timestamp: Number(ts) };\n}\n\nfunction llMaskEmail(email) {\n  const [local, domain] = String(email || '').split('@');\n  return local ? local.slice(0, 1) + '***@' + (domain || '') : '-';\n}\n\nconst input = $input.first().json;\nconst ctx = input.ctx;\nconst attempt = input.attempt || 0;\nconst base = String($env.LENDLOOP_CONVEX_SITE_URL || '').replace(/\\/$/, '');\nif (!base) throw new Error('LENDLOOP_CONVEX_SITE_URL is not set');\nconst body = JSON.stringify({ events: ctx.events });\nconst headers = llSign({ keys: $env.LENDLOOP_N2C_KEYS, method: 'POST', route: '/n8n/automation-events', body });\nreturn [{ json: { ctx, attempt, request: { url: base + '/n8n/automation-events', body, headers } } }];\n"
+      }
+    },
+    {
+      "id": "b663ee1e-fd61-5626-a8e5-c01675e91d9c",
+      "position": [
+        2400,
+        300
+      ],
+      "name": "HTTP: write back reminders",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.request.url }}",
+        "sendHeaders": true,
+        "specifyHeaders": "json",
+        "jsonHeaders": "={{ JSON.stringify($json.request.headers) }}",
+        "options": {
+          "timeout": 10000
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.request.body }}"
+      }
+    },
+    {
+      "id": "79e0ffb5-2e79-5931-a8a3-f70dab903de8",
+      "position": [
+        2400,
+        520
+      ],
+      "name": "Retry gate: write back reminders",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "const prev = $('Sign: write back reminders').first().json;\n// Report only the error itself (never the signed request/headers).\nconst j = $input.first().json;\nconst e = j.error || {};\nconst detail = (typeof e === 'string' ? e : [e.httpCode || e.status || '', e.message || '', e.description || ''].join(' ').trim() || 'unknown error').slice(0, 300);\n\nif (/\\b(400|401|403|413|422)\\b/.test(detail)) {\n  throw new Error('write back reminders rejected by Convex (not retryable): ' + detail);\n}\nconst attempt = (prev.attempt || 0) + 1;\nif (attempt >= 4) {\n  throw new Error('write back reminders failed after ' + attempt + ' attempts: ' + detail);\n}\nreturn [{ json: { ctx: prev.ctx, attempt } }];\n"
+      }
+    },
+    {
+      "id": "df0b7272-2a7b-5b49-a1e4-47030393f0de",
+      "position": [
+        2640,
+        520
+      ],
+      "name": "Backoff: write back reminders",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "webhookId": "7ec5d114-d468-5e48-a519-1f1822156e9e",
+      "parameters": {
+        "amount": "={{ Math.min(30, Math.pow(2, $json.attempt)) }}",
+        "unit": "seconds"
+      }
+    },
+    {
+      "id": "58b59c35-3d15-5e40-ab3a-ac47202cee92",
+      "position": [
+        2640,
+        300
+      ],
+      "name": "Check write-back",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "const results = $input.first().json.results || [];\nconst bad = results.filter((r) => r.status === 'rejected');\nconst failedSends = ($('Sign: write back reminders').first().json.ctx.events || []).filter((e) => e.kind === 'reminder_failed');\nif (bad.length) throw new Error('Convex rejected ' + bad.length + ' reminder write-back(s): ' + JSON.stringify(bad).slice(0, 300));\nif (failedSends.length) throw new Error(failedSends.length + ' reminder(s) could not be delivered (recorded as reminder_failed)');\nreturn [{ json: { recorded: results.filter((r) => r.status === 'recorded').length, duplicates: results.filter((r) => r.status === 'duplicate').length } }];\n"
+      }
+    }
+  ],
+  "connections": {
+    "Sign: issue reminder tickets": {
+      "main": [
+        [
+          {
+            "node": "HTTP: issue reminder tickets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP: issue reminder tickets": {
+      "main": [
+        [
+          {
+            "node": "Any reminders due?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Retry gate: issue reminder tickets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retry gate: issue reminder tickets": {
+      "main": [
+        [
+          {
+            "node": "Backoff: issue reminder tickets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Backoff: issue reminder tickets": {
+      "main": [
+        [
+          {
+            "node": "Sign: issue reminder tickets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sign: redeem reminder tickets": {
+      "main": [
+        [
+          {
+            "node": "HTTP: redeem reminder tickets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP: redeem reminder tickets": {
+      "main": [
+        [
+          {
+            "node": "Send reminders (mock)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Retry gate: redeem reminder tickets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retry gate: redeem reminder tickets": {
+      "main": [
+        [
+          {
+            "node": "Backoff: redeem reminder tickets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Backoff: redeem reminder tickets": {
+      "main": [
+        [
+          {
+            "node": "Sign: redeem reminder tickets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sign: write back reminders": {
+      "main": [
+        [
+          {
+            "node": "HTTP: write back reminders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP: write back reminders": {
+      "main": [
+        [
+          {
+            "node": "Check write-back",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Retry gate: write back reminders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retry gate: write back reminders": {
+      "main": [
+        [
+          {
+            "node": "Backoff: write back reminders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Backoff: write back reminders": {
+      "main": [
+        [
+          {
+            "node": "Sign: write back reminders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Every day 08:00": {
+      "main": [
+        [
+          {
+            "node": "Start",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run now (manual)": {
+      "main": [
+        [
+          {
+            "node": "Start",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Start": {
+      "main": [
+        [
+          {
+            "node": "Sign: issue reminder tickets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Any reminders due?": {
+      "main": [
+        [
+          {
+            "node": "Sign: redeem reminder tickets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send reminders (mock)": {
+      "main": [
+        [
+          {
+            "node": "Sign: write back reminders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "LLerrorHandler01",
+    "saveDataSuccessExecution": "none",
+    "saveDataErrorExecution": "all",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "pinData": {},
+  "tags": []
+}

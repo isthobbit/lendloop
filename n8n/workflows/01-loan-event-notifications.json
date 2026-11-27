@@ -1,0 +1,441 @@
+{
+  "id": "LLloanEvents0001",
+  "name": "LendLoop: Loan event notifications",
+  "active": false,
+  "nodes": [
+    {
+      "id": "a3ca6a74-7d19-5a19-a2d9-e4f9b8feaa31",
+      "position": [
+        240,
+        300
+      ],
+      "name": "Loan event webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "webhookId": "8cce562f-11be-5899-a6ec-ba4ff4c66089",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "lendloop-loan-events",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      }
+    },
+    {
+      "id": "6058e7a9-5e43-5e7b-ad2e-da2a7cf39415",
+      "position": [
+        480,
+        300
+      ],
+      "name": "Verify signature",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "// LendLoop signing helpers for n8n Code nodes.\n// Source of truth for the snippet that scripts/build-n8n-workflows.mjs inlines\n// into every Code node that signs or verifies. Mirrors convex/lib/signing.ts;\n// tests/signing.test.ts proves the two are interoperable.\n//\n// Requires NODE_FUNCTION_ALLOW_BUILTIN=crypto on the n8n instance.\nconst crypto = require('crypto');\nconst LL_VERSION = 'LENDLOOP-HMAC-SHA256-V1';\nconst LL_MAX_SKEW = 300;\n\nfunction llParseKeys(raw) {\n  const ring = new Map();\n  for (const part of String(raw || '').split(',')) {\n    const i = part.indexOf(':');\n    if (i <= 0) continue;\n    const kid = part.slice(0, i).trim();\n    const secret = part.slice(i + 1).trim();\n    if (kid && secret.length >= 32) ring.set(kid, secret);\n  }\n  return ring;\n}\n\nfunction llCanonical(p) {\n  const bodyHash = crypto.createHash('sha256').update(p.body, 'utf8').digest('hex');\n  return [LL_VERSION, p.keyId, p.timestamp, p.nonce, p.method.toUpperCase(), p.route, bodyHash].join('\\n');\n}\n\nfunction llSign(p) {\n  const first = llParseKeys(p.keys).entries().next();\n  if (first.done) throw new Error('LendLoop signing key is not configured');\n  const [keyId, secret] = first.value;\n  const timestamp = String(Math.floor((p.now || Date.now()) / 1000));\n  const nonce = crypto.randomBytes(16).toString('hex');\n  const sig = crypto\n    .createHmac('sha256', secret)\n    .update(llCanonical({ keyId, timestamp, nonce, method: p.method, route: p.route, body: p.body }), 'utf8')\n    .digest('hex');\n  return {\n    'x-lendloop-key-id': keyId,\n    'x-lendloop-timestamp': timestamp,\n    'x-lendloop-nonce': nonce,\n    'x-lendloop-signature': sig,\n  };\n}\n\nfunction llVerify(p) {\n  const h = {};\n  for (const [k, v] of Object.entries(p.headers || {})) h[k.toLowerCase()] = Array.isArray(v) ? v[0] : v;\n  const keyId = h['x-lendloop-key-id'] || '';\n  const ts = h['x-lendloop-timestamp'] || '';\n  const nonce = h['x-lendloop-nonce'] || '';\n  const sig = h['x-lendloop-signature'] || '';\n  if (!keyId || !ts || !nonce || !sig) return { ok: false, reason: 'missing_headers' };\n  if (!/^[0-9a-f]{32}$/i.test(nonce)) return { ok: false, reason: 'bad_nonce' };\n  if (!/^\\d{9,11}$/.test(ts)) return { ok: false, reason: 'bad_timestamp' };\n  const secret = llParseKeys(p.keys).get(keyId);\n  if (!secret) return { ok: false, reason: 'unknown_key' };\n  const nowSec = Math.floor((p.now || Date.now()) / 1000);\n  if (Math.abs(nowSec - Number(ts)) > LL_MAX_SKEW) return { ok: false, reason: 'stale' };\n  if (!/^[0-9a-f]{64}$/i.test(sig)) return { ok: false, reason: 'bad_signature_format' };\n  const expected = crypto\n    .createHmac('sha256', secret)\n    .update(llCanonical({ keyId, timestamp: ts, nonce, method: p.method, route: p.route, body: p.body }), 'utf8')\n    .digest();\n  const given = Buffer.from(sig, 'hex');\n  if (!crypto.timingSafeEqual(expected, given)) return { ok: false, reason: 'bad_signature' };\n  return { ok: true, keyId, nonce, timestamp: Number(ts) };\n}\n\nfunction llMaskEmail(email) {\n  const [local, domain] = String(email || '').split('@');\n  return local ? local.slice(0, 1) + '***@' + (domain || '') : '-';\n}\n\n// 1) Verify the HMAC over the RAW body (byte-exact), bound to this route.\nconst item = $input.first();\nlet raw;\ntry {\n  raw = (await this.helpers.getBinaryDataBuffer(0, 'data')).toString('utf8');\n} catch (e) {\n  raw = JSON.stringify(item.json.body);\n}\nconst result = llVerify({ keys: $env.LENDLOOP_C2N_KEYS, headers: item.json.headers, method: 'POST', route: 'n8n:loan-events', body: raw });\nlet valid = result.ok;\nlet reason = result.ok ? null : result.reason;\n\n// 2) Replay protection: each nonce is accepted once within a 10 minute window.\nif (valid) {\n  const store = $getWorkflowStaticData('global');\n  const now = Date.now();\n  store.nonces = Object.fromEntries(Object.entries(store.nonces || {}).filter(([, exp]) => exp > now));\n  const key = result.keyId + ':' + result.nonce;\n  if (store.nonces[key]) { valid = false; reason = 'replayed_nonce'; }\n  else store.nonces[key] = now + 600000;\n}\n\n// 3) Strict shape check. The payload carries no personal data by design.\nlet event = null;\nif (valid) {\n  try { event = JSON.parse(raw); } catch (e) { valid = false; reason = 'invalid_json'; }\n}\nif (valid && !(event && typeof event.eventId === 'string' && typeof event.loanId === 'string'\n    && typeof event.type === 'string' && /^[0-9a-f]{64}$/.test(String(event.ticket)))) {\n  valid = false; reason = 'bad_payload';\n}\nif (!valid) console.warn('[lendloop] rejected webhook: ' + reason);\n\n// Headers and the raw body are dropped here; downstream nodes only see ctx.\nreturn [{ json: { valid, reason, ctx: valid ? { eventId: event.eventId, type: event.type, loanId: event.loanId, ticket: event.ticket } : null } }];\n"
+      }
+    },
+    {
+      "id": "9f68da25-e23c-5c67-ac4a-37937d0a3915",
+      "position": [
+        720,
+        300
+      ],
+      "name": "Signature valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c3082e84-fb6a-53f4-aa82-fabd1093e82c",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "6176f62d-1e14-5e06-a1f9-82b3998a5f32",
+      "position": [
+        960,
+        300
+      ],
+      "name": "Respond 202",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\"accepted\":true}",
+        "options": {
+          "responseCode": 202
+        }
+      }
+    },
+    {
+      "id": "c2c0e14f-11bd-54fa-a441-b779d174f71a",
+      "position": [
+        960,
+        520
+      ],
+      "name": "Respond 401",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\"error\":\"unauthorized\"}",
+        "options": {
+          "responseCode": 401
+        }
+      }
+    },
+    {
+      "id": "2d391ce8-8746-58db-a200-26a7b90f490d",
+      "position": [
+        1200,
+        300
+      ],
+      "name": "Sign: redeem ticket",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "// LendLoop signing helpers for n8n Code nodes.\n// Source of truth for the snippet that scripts/build-n8n-workflows.mjs inlines\n// into every Code node that signs or verifies. Mirrors convex/lib/signing.ts;\n// tests/signing.test.ts proves the two are interoperable.\n//\n// Requires NODE_FUNCTION_ALLOW_BUILTIN=crypto on the n8n instance.\nconst crypto = require('crypto');\nconst LL_VERSION = 'LENDLOOP-HMAC-SHA256-V1';\nconst LL_MAX_SKEW = 300;\n\nfunction llParseKeys(raw) {\n  const ring = new Map();\n  for (const part of String(raw || '').split(',')) {\n    const i = part.indexOf(':');\n    if (i <= 0) continue;\n    const kid = part.slice(0, i).trim();\n    const secret = part.slice(i + 1).trim();\n    if (kid && secret.length >= 32) ring.set(kid, secret);\n  }\n  return ring;\n}\n\nfunction llCanonical(p) {\n  const bodyHash = crypto.createHash('sha256').update(p.body, 'utf8').digest('hex');\n  return [LL_VERSION, p.keyId, p.timestamp, p.nonce, p.method.toUpperCase(), p.route, bodyHash].join('\\n');\n}\n\nfunction llSign(p) {\n  const first = llParseKeys(p.keys).entries().next();\n  if (first.done) throw new Error('LendLoop signing key is not configured');\n  const [keyId, secret] = first.value;\n  const timestamp = String(Math.floor((p.now || Date.now()) / 1000));\n  const nonce = crypto.randomBytes(16).toString('hex');\n  const sig = crypto\n    .createHmac('sha256', secret)\n    .update(llCanonical({ keyId, timestamp, nonce, method: p.method, route: p.route, body: p.body }), 'utf8')\n    .digest('hex');\n  return {\n    'x-lendloop-key-id': keyId,\n    'x-lendloop-timestamp': timestamp,\n    'x-lendloop-nonce': nonce,\n    'x-lendloop-signature': sig,\n  };\n}\n\nfunction llVerify(p) {\n  const h = {};\n  for (const [k, v] of Object.entries(p.headers || {})) h[k.toLowerCase()] = Array.isArray(v) ? v[0] : v;\n  const keyId = h['x-lendloop-key-id'] || '';\n  const ts = h['x-lendloop-timestamp'] || '';\n  const nonce = h['x-lendloop-nonce'] || '';\n  const sig = h['x-lendloop-signature'] || '';\n  if (!keyId || !ts || !nonce || !sig) return { ok: false, reason: 'missing_headers' };\n  if (!/^[0-9a-f]{32}$/i.test(nonce)) return { ok: false, reason: 'bad_nonce' };\n  if (!/^\\d{9,11}$/.test(ts)) return { ok: false, reason: 'bad_timestamp' };\n  const secret = llParseKeys(p.keys).get(keyId);\n  if (!secret) return { ok: false, reason: 'unknown_key' };\n  const nowSec = Math.floor((p.now || Date.now()) / 1000);\n  if (Math.abs(nowSec - Number(ts)) > LL_MAX_SKEW) return { ok: false, reason: 'stale' };\n  if (!/^[0-9a-f]{64}$/i.test(sig)) return { ok: false, reason: 'bad_signature_format' };\n  const expected = crypto\n    .createHmac('sha256', secret)\n    .update(llCanonical({ keyId, timestamp: ts, nonce, method: p.method, route: p.route, body: p.body }), 'utf8')\n    .digest();\n  const given = Buffer.from(sig, 'hex');\n  if (!crypto.timingSafeEqual(expected, given)) return { ok: false, reason: 'bad_signature' };\n  return { ok: true, keyId, nonce, timestamp: Number(ts) };\n}\n\nfunction llMaskEmail(email) {\n  const [local, domain] = String(email || '').split('@');\n  return local ? local.slice(0, 1) + '***@' + (domain || '') : '-';\n}\n\nconst input = $input.first().json;\nconst ctx = input.ctx;\nconst attempt = input.attempt || 0;\nconst base = String($env.LENDLOOP_CONVEX_SITE_URL || '').replace(/\\/$/, '');\nif (!base) throw new Error('LENDLOOP_CONVEX_SITE_URL is not set');\nconst body = JSON.stringify({ ticket: ctx.ticket });\nconst headers = llSign({ keys: $env.LENDLOOP_N2C_KEYS, method: 'POST', route: '/n8n/notifications/redeem', body });\nreturn [{ json: { ctx, attempt, request: { url: base + '/n8n/notifications/redeem', body, headers } } }];\n"
+      }
+    },
+    {
+      "id": "be2a2f33-7c5e-5232-a408-7869d80f6e8d",
+      "position": [
+        1440,
+        300
+      ],
+      "name": "HTTP: redeem ticket",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.request.url }}",
+        "sendHeaders": true,
+        "specifyHeaders": "json",
+        "jsonHeaders": "={{ JSON.stringify($json.request.headers) }}",
+        "options": {
+          "timeout": 10000
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.request.body }}"
+      }
+    },
+    {
+      "id": "fc9567e5-9ce2-57ff-a516-012f25c56bb0",
+      "position": [
+        1440,
+        520
+      ],
+      "name": "Retry gate: redeem ticket",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "const prev = $('Sign: redeem ticket').first().json;\n// Report only the error itself (never the signed request/headers).\nconst j = $input.first().json;\nconst e = j.error || {};\nconst detail = (typeof e === 'string' ? e : [e.httpCode || e.status || '', e.message || '', e.description || ''].join(' ').trim() || 'unknown error').slice(0, 300);\nif (/\\b410\\b/.test(detail)) {\n  console.log('[lendloop] redeem ticket: ticket no longer valid (already handled or superseded); stopping quietly');\n  return [];\n}\nif (/\\b(400|401|403|413|422)\\b/.test(detail)) {\n  throw new Error('redeem ticket rejected by Convex (not retryable): ' + detail);\n}\nconst attempt = (prev.attempt || 0) + 1;\nif (attempt >= 4) {\n  throw new Error('redeem ticket failed after ' + attempt + ' attempts: ' + detail);\n}\nreturn [{ json: { ctx: prev.ctx, attempt } }];\n"
+      }
+    },
+    {
+      "id": "74e5aa9d-e550-5226-a108-47a8d5310a7c",
+      "position": [
+        1680,
+        520
+      ],
+      "name": "Backoff: redeem ticket",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "webhookId": "a5fc9642-20a2-5056-a057-d98fddc9d8cd",
+      "parameters": {
+        "amount": "={{ Math.min(30, Math.pow(2, $json.attempt)) }}",
+        "unit": "seconds"
+      }
+    },
+    {
+      "id": "d9f8fa8c-fa3c-5604-afeb-c0d327eb0dce",
+      "position": [
+        1680,
+        300
+      ],
+      "name": "Compose + deliver (mock)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "// LendLoop signing helpers for n8n Code nodes.\n// Source of truth for the snippet that scripts/build-n8n-workflows.mjs inlines\n// into every Code node that signs or verifies. Mirrors convex/lib/signing.ts;\n// tests/signing.test.ts proves the two are interoperable.\n//\n// Requires NODE_FUNCTION_ALLOW_BUILTIN=crypto on the n8n instance.\nconst crypto = require('crypto');\nconst LL_VERSION = 'LENDLOOP-HMAC-SHA256-V1';\nconst LL_MAX_SKEW = 300;\n\nfunction llParseKeys(raw) {\n  const ring = new Map();\n  for (const part of String(raw || '').split(',')) {\n    const i = part.indexOf(':');\n    if (i <= 0) continue;\n    const kid = part.slice(0, i).trim();\n    const secret = part.slice(i + 1).trim();\n    if (kid && secret.length >= 32) ring.set(kid, secret);\n  }\n  return ring;\n}\n\nfunction llCanonical(p) {\n  const bodyHash = crypto.createHash('sha256').update(p.body, 'utf8').digest('hex');\n  return [LL_VERSION, p.keyId, p.timestamp, p.nonce, p.method.toUpperCase(), p.route, bodyHash].join('\\n');\n}\n\nfunction llSign(p) {\n  const first = llParseKeys(p.keys).entries().next();\n  if (first.done) throw new Error('LendLoop signing key is not configured');\n  const [keyId, secret] = first.value;\n  const timestamp = String(Math.floor((p.now || Date.now()) / 1000));\n  const nonce = crypto.randomBytes(16).toString('hex');\n  const sig = crypto\n    .createHmac('sha256', secret)\n    .update(llCanonical({ keyId, timestamp, nonce, method: p.method, route: p.route, body: p.body }), 'utf8')\n    .digest('hex');\n  return {\n    'x-lendloop-key-id': keyId,\n    'x-lendloop-timestamp': timestamp,\n    'x-lendloop-nonce': nonce,\n    'x-lendloop-signature': sig,\n  };\n}\n\nfunction llVerify(p) {\n  const h = {};\n  for (const [k, v] of Object.entries(p.headers || {})) h[k.toLowerCase()] = Array.isArray(v) ? v[0] : v;\n  const keyId = h['x-lendloop-key-id'] || '';\n  const ts = h['x-lendloop-timestamp'] || '';\n  const nonce = h['x-lendloop-nonce'] || '';\n  const sig = h['x-lendloop-signature'] || '';\n  if (!keyId || !ts || !nonce || !sig) return { ok: false, reason: 'missing_headers' };\n  if (!/^[0-9a-f]{32}$/i.test(nonce)) return { ok: false, reason: 'bad_nonce' };\n  if (!/^\\d{9,11}$/.test(ts)) return { ok: false, reason: 'bad_timestamp' };\n  const secret = llParseKeys(p.keys).get(keyId);\n  if (!secret) return { ok: false, reason: 'unknown_key' };\n  const nowSec = Math.floor((p.now || Date.now()) / 1000);\n  if (Math.abs(nowSec - Number(ts)) > LL_MAX_SKEW) return { ok: false, reason: 'stale' };\n  if (!/^[0-9a-f]{64}$/i.test(sig)) return { ok: false, reason: 'bad_signature_format' };\n  const expected = crypto\n    .createHmac('sha256', secret)\n    .update(llCanonical({ keyId, timestamp: ts, nonce, method: p.method, route: p.route, body: p.body }), 'utf8')\n    .digest();\n  const given = Buffer.from(sig, 'hex');\n  if (!crypto.timingSafeEqual(expected, given)) return { ok: false, reason: 'bad_signature' };\n  return { ok: true, keyId, nonce, timestamp: Number(ts) };\n}\n\nfunction llMaskEmail(email) {\n  const [local, domain] = String(email || '').split('@');\n  return local ? local.slice(0, 1) + '***@' + (domain || '') : '-';\n}\n\n// The ONLY node that sees the recipient's email. It is used, masked in logs,\n// and not passed downstream.\nconst d = $input.first().json;\nconst ctx = $('Sign: redeem ticket').first().json.ctx;\nconst range = d.startDate + ' to ' + d.endDate;\nconst templates = {\n  'loan.requested': ['New borrow request', 'Hi ' + d.recipient.firstName + ', a neighbour asked to borrow your ' + d.toolName + ' (' + range + '). Open LendLoop to approve or decline.'],\n  'loan.approved':  ['Request approved', 'Good news ' + d.recipient.firstName + ': your request for the ' + d.toolName + ' (' + range + ') was approved.'],\n  'loan.declined':  ['Request declined', 'Hi ' + d.recipient.firstName + ', your request for the ' + d.toolName + ' (' + range + ') was declined.'],\n  'loan.cancelled': ['Request withdrawn', 'Hi ' + d.recipient.firstName + ', a request for your ' + d.toolName + ' (' + range + ') was withdrawn.'],\n  'loan.returned':  ['Loan closed', 'Thanks ' + d.recipient.firstName + '! The ' + d.toolName + ' was marked as returned.'],\n};\nconst [subject, text] = templates[d.type] || ['LendLoop update', 'There is an update on one of your loans.'];\n\n// ---- Mock channel. Swap this block for a Send Email / Slack node that uses an\n// ---- n8n credential (see README > \"Real notification channel\").\nconsole.log('[lendloop] notify ' + llMaskEmail(d.recipient.email) + ' | ' + subject + ' | ' + text);\n\nreturn [{ json: { ctx: { loanId: ctx.loanId, ticket: ctx.ticket, channel: 'mock', subject } } }];\n"
+      }
+    },
+    {
+      "id": "b6d42df4-6dca-5d02-a95c-afb04ca7febb",
+      "position": [
+        1920,
+        300
+      ],
+      "name": "Sign: record notification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "// LendLoop signing helpers for n8n Code nodes.\n// Source of truth for the snippet that scripts/build-n8n-workflows.mjs inlines\n// into every Code node that signs or verifies. Mirrors convex/lib/signing.ts;\n// tests/signing.test.ts proves the two are interoperable.\n//\n// Requires NODE_FUNCTION_ALLOW_BUILTIN=crypto on the n8n instance.\nconst crypto = require('crypto');\nconst LL_VERSION = 'LENDLOOP-HMAC-SHA256-V1';\nconst LL_MAX_SKEW = 300;\n\nfunction llParseKeys(raw) {\n  const ring = new Map();\n  for (const part of String(raw || '').split(',')) {\n    const i = part.indexOf(':');\n    if (i <= 0) continue;\n    const kid = part.slice(0, i).trim();\n    const secret = part.slice(i + 1).trim();\n    if (kid && secret.length >= 32) ring.set(kid, secret);\n  }\n  return ring;\n}\n\nfunction llCanonical(p) {\n  const bodyHash = crypto.createHash('sha256').update(p.body, 'utf8').digest('hex');\n  return [LL_VERSION, p.keyId, p.timestamp, p.nonce, p.method.toUpperCase(), p.route, bodyHash].join('\\n');\n}\n\nfunction llSign(p) {\n  const first = llParseKeys(p.keys).entries().next();\n  if (first.done) throw new Error('LendLoop signing key is not configured');\n  const [keyId, secret] = first.value;\n  const timestamp = String(Math.floor((p.now || Date.now()) / 1000));\n  const nonce = crypto.randomBytes(16).toString('hex');\n  const sig = crypto\n    .createHmac('sha256', secret)\n    .update(llCanonical({ keyId, timestamp, nonce, method: p.method, route: p.route, body: p.body }), 'utf8')\n    .digest('hex');\n  return {\n    'x-lendloop-key-id': keyId,\n    'x-lendloop-timestamp': timestamp,\n    'x-lendloop-nonce': nonce,\n    'x-lendloop-signature': sig,\n  };\n}\n\nfunction llVerify(p) {\n  const h = {};\n  for (const [k, v] of Object.entries(p.headers || {})) h[k.toLowerCase()] = Array.isArray(v) ? v[0] : v;\n  const keyId = h['x-lendloop-key-id'] || '';\n  const ts = h['x-lendloop-timestamp'] || '';\n  const nonce = h['x-lendloop-nonce'] || '';\n  const sig = h['x-lendloop-signature'] || '';\n  if (!keyId || !ts || !nonce || !sig) return { ok: false, reason: 'missing_headers' };\n  if (!/^[0-9a-f]{32}$/i.test(nonce)) return { ok: false, reason: 'bad_nonce' };\n  if (!/^\\d{9,11}$/.test(ts)) return { ok: false, reason: 'bad_timestamp' };\n  const secret = llParseKeys(p.keys).get(keyId);\n  if (!secret) return { ok: false, reason: 'unknown_key' };\n  const nowSec = Math.floor((p.now || Date.now()) / 1000);\n  if (Math.abs(nowSec - Number(ts)) > LL_MAX_SKEW) return { ok: false, reason: 'stale' };\n  if (!/^[0-9a-f]{64}$/i.test(sig)) return { ok: false, reason: 'bad_signature_format' };\n  const expected = crypto\n    .createHmac('sha256', secret)\n    .update(llCanonical({ keyId, timestamp: ts, nonce, method: p.method, route: p.route, body: p.body }), 'utf8')\n    .digest();\n  const given = Buffer.from(sig, 'hex');\n  if (!crypto.timingSafeEqual(expected, given)) return { ok: false, reason: 'bad_signature' };\n  return { ok: true, keyId, nonce, timestamp: Number(ts) };\n}\n\nfunction llMaskEmail(email) {\n  const [local, domain] = String(email || '').split('@');\n  return local ? local.slice(0, 1) + '***@' + (domain || '') : '-';\n}\n\nconst input = $input.first().json;\nconst ctx = input.ctx;\nconst attempt = input.attempt || 0;\nconst base = String($env.LENDLOOP_CONVEX_SITE_URL || '').replace(/\\/$/, '');\nif (!base) throw new Error('LENDLOOP_CONVEX_SITE_URL is not set');\nconst body = JSON.stringify({ events: [{ kind: 'notification_sent', loanId: ctx.loanId, ticket: ctx.ticket, channel: ctx.channel, executionId: String($execution.id) }] });\nconst headers = llSign({ keys: $env.LENDLOOP_N2C_KEYS, method: 'POST', route: '/n8n/automation-events', body });\nreturn [{ json: { ctx, attempt, request: { url: base + '/n8n/automation-events', body, headers } } }];\n"
+      }
+    },
+    {
+      "id": "25a34a78-c958-5b98-a95e-27b90a0be76a",
+      "position": [
+        2160,
+        300
+      ],
+      "name": "HTTP: record notification",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.request.url }}",
+        "sendHeaders": true,
+        "specifyHeaders": "json",
+        "jsonHeaders": "={{ JSON.stringify($json.request.headers) }}",
+        "options": {
+          "timeout": 10000
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.request.body }}"
+      }
+    },
+    {
+      "id": "3bcb6abe-b9f3-54fc-af44-5c7321687082",
+      "position": [
+        2160,
+        520
+      ],
+      "name": "Retry gate: record notification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "const prev = $('Sign: record notification').first().json;\n// Report only the error itself (never the signed request/headers).\nconst j = $input.first().json;\nconst e = j.error || {};\nconst detail = (typeof e === 'string' ? e : [e.httpCode || e.status || '', e.message || '', e.description || ''].join(' ').trim() || 'unknown error').slice(0, 300);\n\nif (/\\b(400|401|403|413|422)\\b/.test(detail)) {\n  throw new Error('record notification rejected by Convex (not retryable): ' + detail);\n}\nconst attempt = (prev.attempt || 0) + 1;\nif (attempt >= 4) {\n  throw new Error('record notification failed after ' + attempt + ' attempts: ' + detail);\n}\nreturn [{ json: { ctx: prev.ctx, attempt } }];\n"
+      }
+    },
+    {
+      "id": "805c7774-7a08-5d34-a14c-16d16b57c2e8",
+      "position": [
+        2400,
+        520
+      ],
+      "name": "Backoff: record notification",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "webhookId": "8a1a7cfe-023f-50c6-a3eb-7b94da35b56d",
+      "parameters": {
+        "amount": "={{ Math.min(30, Math.pow(2, $json.attempt)) }}",
+        "unit": "seconds"
+      }
+    },
+    {
+      "id": "20c6b9dd-1274-5d74-a47a-808a8a2a5607",
+      "position": [
+        2400,
+        300
+      ],
+      "name": "Check write-back",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "const results = $input.first().json.results || [];\nconst bad = results.filter((r) => r.status === 'rejected');\nif (bad.length) throw new Error('Convex rejected notification write-back: ' + JSON.stringify(bad));\nreturn [{ json: { ok: true, results } }];\n"
+      }
+    }
+  ],
+  "connections": {
+    "Sign: redeem ticket": {
+      "main": [
+        [
+          {
+            "node": "HTTP: redeem ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP: redeem ticket": {
+      "main": [
+        [
+          {
+            "node": "Compose + deliver (mock)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Retry gate: redeem ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retry gate: redeem ticket": {
+      "main": [
+        [
+          {
+            "node": "Backoff: redeem ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Backoff: redeem ticket": {
+      "main": [
+        [
+          {
+            "node": "Sign: redeem ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sign: record notification": {
+      "main": [
+        [
+          {
+            "node": "HTTP: record notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP: record notification": {
+      "main": [
+        [
+          {
+            "node": "Check write-back",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Retry gate: record notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retry gate: record notification": {
+      "main": [
+        [
+          {
+            "node": "Backoff: record notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Backoff: record notification": {
+      "main": [
+        [
+          {
+            "node": "Sign: record notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loan event webhook": {
+      "main": [
+        [
+          {
+            "node": "Verify signature",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify signature": {
+      "main": [
+        [
+          {
+            "node": "Signature valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Signature valid?": {
+      "main": [
+        [
+          {
+            "node": "Respond 202",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond 401",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond 202": {
+      "main": [
+        [
+          {
+            "node": "Sign: redeem ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compose + deliver (mock)": {
+      "main": [
+        [
+          {
+            "node": "Sign: record notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "LLerrorHandler01",
+    "saveDataSuccessExecution": "none",
+    "saveDataErrorExecution": "all",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "pinData": {},
+  "tags": []
+}

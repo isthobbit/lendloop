@@ -1,0 +1,175 @@
+{
+  "id": "LLerrorHandler01",
+  "name": "LendLoop: Error handler",
+  "active": false,
+  "nodes": [
+    {
+      "id": "346451ea-5a91-579d-a95b-a7011fb80bc3",
+      "position": [
+        240,
+        300
+      ],
+      "name": "On workflow error",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "parameters": {}
+    },
+    {
+      "id": "7a69782e-28e6-55e2-af45-6b3377325e79",
+      "position": [
+        480,
+        300
+      ],
+      "name": "Build error report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\nconst report = {\n  workflow: (d.workflow && d.workflow.name) || 'unknown',\n  node: (d.execution && d.execution.lastNodeExecuted) || 'unknown',\n  message: String((d.execution && d.execution.error && d.execution.error.message) || 'unknown error').slice(0, 1000),\n  executionId: d.execution && d.execution.id ? String(d.execution.id) : undefined,\n};\n// Always visible in n8n's own logs, even if Convex is unreachable.\nconsole.error('[lendloop] workflow failure: ' + report.workflow + ' / ' + report.node + ': ' + report.message);\nreturn [{ json: { ctx: { report } } }];\n"
+      }
+    },
+    {
+      "id": "a6959857-6a4d-5ccc-aa14-c4bb13250fbe",
+      "position": [
+        720,
+        300
+      ],
+      "name": "Sign: report error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "// LendLoop signing helpers for n8n Code nodes.\n// Source of truth for the snippet that scripts/build-n8n-workflows.mjs inlines\n// into every Code node that signs or verifies. Mirrors convex/lib/signing.ts;\n// tests/signing.test.ts proves the two are interoperable.\n//\n// Requires NODE_FUNCTION_ALLOW_BUILTIN=crypto on the n8n instance.\nconst crypto = require('crypto');\nconst LL_VERSION = 'LENDLOOP-HMAC-SHA256-V1';\nconst LL_MAX_SKEW = 300;\n\nfunction llParseKeys(raw) {\n  const ring = new Map();\n  for (const part of String(raw || '').split(',')) {\n    const i = part.indexOf(':');\n    if (i <= 0) continue;\n    const kid = part.slice(0, i).trim();\n    const secret = part.slice(i + 1).trim();\n    if (kid && secret.length >= 32) ring.set(kid, secret);\n  }\n  return ring;\n}\n\nfunction llCanonical(p) {\n  const bodyHash = crypto.createHash('sha256').update(p.body, 'utf8').digest('hex');\n  return [LL_VERSION, p.keyId, p.timestamp, p.nonce, p.method.toUpperCase(), p.route, bodyHash].join('\\n');\n}\n\nfunction llSign(p) {\n  const first = llParseKeys(p.keys).entries().next();\n  if (first.done) throw new Error('LendLoop signing key is not configured');\n  const [keyId, secret] = first.value;\n  const timestamp = String(Math.floor((p.now || Date.now()) / 1000));\n  const nonce = crypto.randomBytes(16).toString('hex');\n  const sig = crypto\n    .createHmac('sha256', secret)\n    .update(llCanonical({ keyId, timestamp, nonce, method: p.method, route: p.route, body: p.body }), 'utf8')\n    .digest('hex');\n  return {\n    'x-lendloop-key-id': keyId,\n    'x-lendloop-timestamp': timestamp,\n    'x-lendloop-nonce': nonce,\n    'x-lendloop-signature': sig,\n  };\n}\n\nfunction llVerify(p) {\n  const h = {};\n  for (const [k, v] of Object.entries(p.headers || {})) h[k.toLowerCase()] = Array.isArray(v) ? v[0] : v;\n  const keyId = h['x-lendloop-key-id'] || '';\n  const ts = h['x-lendloop-timestamp'] || '';\n  const nonce = h['x-lendloop-nonce'] || '';\n  const sig = h['x-lendloop-signature'] || '';\n  if (!keyId || !ts || !nonce || !sig) return { ok: false, reason: 'missing_headers' };\n  if (!/^[0-9a-f]{32}$/i.test(nonce)) return { ok: false, reason: 'bad_nonce' };\n  if (!/^\\d{9,11}$/.test(ts)) return { ok: false, reason: 'bad_timestamp' };\n  const secret = llParseKeys(p.keys).get(keyId);\n  if (!secret) return { ok: false, reason: 'unknown_key' };\n  const nowSec = Math.floor((p.now || Date.now()) / 1000);\n  if (Math.abs(nowSec - Number(ts)) > LL_MAX_SKEW) return { ok: false, reason: 'stale' };\n  if (!/^[0-9a-f]{64}$/i.test(sig)) return { ok: false, reason: 'bad_signature_format' };\n  const expected = crypto\n    .createHmac('sha256', secret)\n    .update(llCanonical({ keyId, timestamp: ts, nonce, method: p.method, route: p.route, body: p.body }), 'utf8')\n    .digest();\n  const given = Buffer.from(sig, 'hex');\n  if (!crypto.timingSafeEqual(expected, given)) return { ok: false, reason: 'bad_signature' };\n  return { ok: true, keyId, nonce, timestamp: Number(ts) };\n}\n\nfunction llMaskEmail(email) {\n  const [local, domain] = String(email || '').split('@');\n  return local ? local.slice(0, 1) + '***@' + (domain || '') : '-';\n}\n\nconst input = $input.first().json;\nconst ctx = input.ctx;\nconst attempt = input.attempt || 0;\nconst base = String($env.LENDLOOP_CONVEX_SITE_URL || '').replace(/\\/$/, '');\nif (!base) throw new Error('LENDLOOP_CONVEX_SITE_URL is not set');\nconst body = JSON.stringify(ctx.report);\nconst headers = llSign({ keys: $env.LENDLOOP_N2C_KEYS, method: 'POST', route: '/n8n/automation-errors', body });\nreturn [{ json: { ctx, attempt, request: { url: base + '/n8n/automation-errors', body, headers } } }];\n"
+      }
+    },
+    {
+      "id": "6be935c7-4107-5326-a903-af7c697515ab",
+      "position": [
+        960,
+        300
+      ],
+      "name": "HTTP: report error",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.request.url }}",
+        "sendHeaders": true,
+        "specifyHeaders": "json",
+        "jsonHeaders": "={{ JSON.stringify($json.request.headers) }}",
+        "options": {
+          "timeout": 10000
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.request.body }}"
+      }
+    },
+    {
+      "id": "90f3ba5a-44ca-5763-aa83-3ba67c181ade",
+      "position": [
+        960,
+        520
+      ],
+      "name": "Retry gate: report error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "const prev = $('Sign: report error').first().json;\n// Report only the error itself (never the signed request/headers).\nconst j = $input.first().json;\nconst e = j.error || {};\nconst detail = (typeof e === 'string' ? e : [e.httpCode || e.status || '', e.message || '', e.description || ''].join(' ').trim() || 'unknown error').slice(0, 300);\n\nif (/\\b(400|401|403|413|422)\\b/.test(detail)) {\n  throw new Error('report error rejected by Convex (not retryable): ' + detail);\n}\nconst attempt = (prev.attempt || 0) + 1;\nif (attempt >= 4) {\n  console.error('[lendloop] report error failed after ' + attempt + ' attempts: ' + detail);\n  return [];\n}\nreturn [{ json: { ctx: prev.ctx, attempt } }];\n"
+      }
+    },
+    {
+      "id": "c2727d51-57ad-56a4-abeb-607b9851138a",
+      "position": [
+        1200,
+        520
+      ],
+      "name": "Backoff: report error",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "webhookId": "d41db91a-7c35-575c-a8ef-9e42e9681fbe",
+      "parameters": {
+        "amount": "={{ Math.min(30, Math.pow(2, $json.attempt)) }}",
+        "unit": "seconds"
+      }
+    }
+  ],
+  "connections": {
+    "Sign: report error": {
+      "main": [
+        [
+          {
+            "node": "HTTP: report error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP: report error": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Retry gate: report error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retry gate: report error": {
+      "main": [
+        [
+          {
+            "node": "Backoff: report error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Backoff: report error": {
+      "main": [
+        [
+          {
+            "node": "Sign: report error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "On workflow error": {
+      "main": [
+        [
+          {
+            "node": "Build error report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build error report": {
+      "main": [
+        [
+          {
+            "node": "Sign: report error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "none",
+    "saveDataErrorExecution": "all",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "pinData": {},
+  "tags": []
+}

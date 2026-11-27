@@ -1,0 +1,10 @@
+node_modules
+.next
+out
+.env
+.env.*
+!.env*.example
+*.tsbuildinfo
+.convex
+n8n/data
+.DS_Store
