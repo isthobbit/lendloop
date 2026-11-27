@@ -29,3 +29,33 @@ jobs:
         run: npm run secrets:check
       - name: Dependency audit
         run: npm audit --audit-level=high --omit=dev
+
+  e2e:
+    name: n8n end-to-end
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      N8N_VERSION: 2.49.5
+    steps:
+      - uses: actions/checkout@v4
+      # n8n's npm package needs Node 24.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # n8n goes in its own folder so it never touches the project's dependencies.
+      - name: Cache n8n
+        id: n8n-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/n8n-e2e/node_modules
+          key: n8n-${{ env.N8N_VERSION }}-node24-${{ runner.os }}
+      - name: Install n8n
+        if: steps.n8n-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/n8n-e2e && cd ~/n8n-e2e
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund "n8n@${N8N_VERSION}"
+      - name: Run end-to-end test against real n8n
+        run: N8N_BIN=~/n8n-e2e/node_modules/n8n/bin/n8n E2E_DEBUG=1 npm run test:e2e

@@ -167,7 +167,7 @@
     "executionOrder": "v1",
     "saveDataSuccessExecution": "none",
     "saveDataErrorExecution": "all",
-    "saveManualExecutions": true,
+    "saveManualExecutions": false,
     "callerPolicy": "workflowsFromSameOwner"
   },
   "pinData": {},

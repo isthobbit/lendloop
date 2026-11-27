@@ -38,7 +38,7 @@ I built it as if it would one day hold sensitive records rather than ladders and
 | 🧾 | **Idempotency keys built on the server.** Convex builds each write-back's key from facts it has checked, not from a value n8n supplies. | A buggy or compromised n8n can't create duplicate reminders by changing the key. |
 | 🔗 | **Tamper-evident audit log.** Every entry stores the SHA-256 hash of the entry before it. Admins can check the whole chain with one click. | Editing, deleting or reordering past entries is detectable. Entries hold ids and actions only, no personal data. |
 | 🚨 | **Failures show up in the app.** The n8n error workflow reports to Convex, so failures appear in the admin **Automation health** panel next to dead-lettered events. | Nothing fails silently, and operators don't need to log in to n8n to notice. |
-| 🧹 | **Data minimization inside n8n.** Successful runs aren't saved; emails are masked in logs; an email exists only in a ticket-redemption response and the one node that sends the message; error reports are scrubbed. | n8n's execution history is a commonly overlooked store of personal data. |
+| 🧹 | **Data minimization inside n8n.** Successful runs aren't saved, including runs started by hand in the editor; emails are masked in logs; an email exists only in a ticket-redemption response and the one node that sends the message; error reports are scrubbed. | n8n's execution history is a commonly overlooked store of personal data. |
 | ✅ | **Tested against real n8n.** An end-to-end test runs the exported workflows on a real n8n instance against the actual Convex verification code. CI fails if a secret is committed or the workflow exports are out of date. | The claims above are checked by tests. |
 
 ---
@@ -353,9 +353,9 @@ To confirm these tests check something real, I removed the owner check from `loa
 3. The reminder run issues and redeems tickets, writes back, and running it again doesn't create a duplicate; the borrower's email appears in n8n logs only masked.
 4. When Convex keeps failing: 4 attempts are made, each with a **fresh, valid signature**; the error workflow then reports to Convex, and the report contains no signatures or tickets.
 
-I ran it against n8n 2.49.5. All checks pass.
+CI runs it on every push against n8n 2.49.5 (Linux, Node 24), as the `n8n end-to-end` job.
 
-**CI (`.github/workflows/ci.yml`)** runs both typechecks, the unit and Convex function tests, checks that the workflow exports are current, runs the secret scan, and runs `npm audit --omit=dev`.
+**CI (`.github/workflows/ci.yml`)** has two jobs. `check` runs both typechecks, the unit and Convex function tests, checks that the workflow exports are current, runs the secret scan, and runs `npm audit --omit=dev`. `e2e` runs the end-to-end test above against a real n8n.
 
 ---
 

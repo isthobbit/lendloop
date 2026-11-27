@@ -152,11 +152,12 @@ return [{ json: { ctx: prev.ctx, attempt } }];`,
       executionOrder: "v1",
       ...(id === ERROR_WORKFLOW_ID ? {} : { errorWorkflow: ERROR_WORKFLOW_ID }),
       // Data minimization inside n8n: successful runs (which briefly hold an
-      // email address) are not persisted. Failed runs are kept for debugging
-      // and pruned by EXECUTIONS_DATA_MAX_AGE.
+      // email address) are not persisted, including runs started by hand from
+      // the editor. Failed runs are kept for debugging and pruned by
+      // EXECUTIONS_DATA_MAX_AGE.
       saveDataSuccessExecution: "none",
       saveDataErrorExecution: "all",
-      saveManualExecutions: true,
+      saveManualExecutions: false,
       callerPolicy: "workflowsFromSameOwner",
     },
     pinData: {},

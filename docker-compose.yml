@@ -27,6 +27,7 @@ x-n8n: &n8n
     # keep failures for 7 days for debugging.
     EXECUTIONS_DATA_SAVE_ON_SUCCESS: none
     EXECUTIONS_DATA_SAVE_ON_ERROR: all
+    EXECUTIONS_DATA_SAVE_MANUAL_EXECUTIONS: "false"
     EXECUTIONS_DATA_PRUNE: "true"
     EXECUTIONS_DATA_MAX_AGE: "168"
     N8N_DIAGNOSTICS_ENABLED: "false"
